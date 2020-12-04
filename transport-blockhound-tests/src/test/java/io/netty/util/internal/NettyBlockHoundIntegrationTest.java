@@ -5,7 +5,7 @@
  * version 2.0 (the "License"); you may not use this file except in compliance
  * with the License. You may obtain a copy of the License at:
 
- * http://www.apache.org/licenses/LICENSE-2.0
+ * https://www.apache.org/licenses/LICENSE-2.0
 
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
@@ -34,6 +34,7 @@ import io.netty.handler.ssl.SslHandshakeCompletionEvent;
 import io.netty.handler.ssl.SslProvider;
 import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
 import io.netty.handler.ssl.util.SelfSignedCertificate;
+import io.netty.util.HashedWheelTimer;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.concurrent.DefaultThreadFactory;
 import io.netty.util.concurrent.EventExecutor;
@@ -51,18 +52,22 @@ import reactor.blockhound.BlockingOperationError;
 import reactor.blockhound.integration.BlockHoundIntegration;
 
 import java.net.InetSocketAddress;
+import java.util.Queue;
 import java.util.ServiceLoader;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.FutureTask;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
 
-import static org.junit.Assert.assertThat;
-import static org.junit.Assert.assertTrue;
+import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.fail;
+import static org.junit.Assume.assumeTrue;
 
 public class NettyBlockHoundIntegrationTest {
 
@@ -127,27 +132,96 @@ public class NettyBlockHoundIntegrationTest {
         latch.await();
     }
 
+    @Test(timeout = 5000L)
+    public void testSingleThreadEventExecutorAddTask() throws Exception {
+        TestLinkedBlockingQueue<Runnable> taskQueue = new TestLinkedBlockingQueue<>();
+        SingleThreadEventExecutor executor =
+                new SingleThreadEventExecutor(null, new DefaultThreadFactory("test"), true) {
+                    @Override
+                    protected Queue<Runnable> newTaskQueue(int maxPendingTasks) {
+                        return taskQueue;
+                    }
+
+                    @Override
+                    protected void run() {
+                        while (!confirmShutdown()) {
+                            Runnable task = takeTask();
+                            if (task != null) {
+                                task.run();
+                            }
+                        }
+                    }
+                };
+        taskQueue.emulateContention();
+        CountDownLatch latch = new CountDownLatch(1);
+        executor.submit(() -> {
+            executor.execute(() -> { }); // calls addTask
+            latch.countDown();
+        });
+        taskQueue.waitUntilContented();
+        taskQueue.removeContention();
+        latch.await();
+    }
+
+    @Test(timeout = 5000L)
+    public void testHashedWheelTimerStartStop() throws Exception {
+        HashedWheelTimer timer = new HashedWheelTimer();
+        Future<?> futureStart = GlobalEventExecutor.INSTANCE.submit(timer::start);
+        futureStart.get(5, TimeUnit.SECONDS);
+        Future<?> futureStop = GlobalEventExecutor.INSTANCE.submit(timer::stop);
+        futureStop.get(5, TimeUnit.SECONDS);
+    }
+
     // Tests copied from io.netty.handler.ssl.SslHandlerTest
     @Test
     public void testHandshakeWithExecutorThatExecuteDirectory() throws Exception {
-        testHandshakeWithExecutor(Runnable::run);
+        testHandshakeWithExecutor(Runnable::run, "TLSv1.2");
+    }
+
+    @Test
+    public void testHandshakeWithExecutorThatExecuteDirectoryTLSv13() throws Exception {
+        assumeTrue(SslProvider.isTlsv13Supported(SslProvider.JDK));
+        testHandshakeWithExecutor(Runnable::run, "TLSv1.3");
     }
 
     @Test
     public void testHandshakeWithImmediateExecutor() throws Exception {
-        testHandshakeWithExecutor(ImmediateExecutor.INSTANCE);
+        testHandshakeWithExecutor(ImmediateExecutor.INSTANCE, "TLSv1.2");
+    }
+
+    @Test
+    public void testHandshakeWithImmediateExecutorTLSv13() throws Exception {
+        assumeTrue(SslProvider.isTlsv13Supported(SslProvider.JDK));
+        testHandshakeWithExecutor(ImmediateExecutor.INSTANCE, "TLSv1.3");
     }
 
     @Test
     public void testHandshakeWithImmediateEventExecutor() throws Exception {
-        testHandshakeWithExecutor(ImmediateEventExecutor.INSTANCE);
+        testHandshakeWithExecutor(ImmediateEventExecutor.INSTANCE, "TLSv1.2");
+    }
+
+    @Test
+    public void testHandshakeWithImmediateEventExecutorTLSv13() throws Exception {
+        assumeTrue(SslProvider.isTlsv13Supported(SslProvider.JDK));
+        testHandshakeWithExecutor(ImmediateEventExecutor.INSTANCE, "TLSv1.3");
     }
 
     @Test
     public void testHandshakeWithExecutor() throws Exception {
         ExecutorService executorService = Executors.newCachedThreadPool();
         try {
-            testHandshakeWithExecutor(executorService);
+            testHandshakeWithExecutor(executorService, "TLSv1.2");
+        } finally {
+            executorService.shutdown();
+        }
+    }
+
+    @Test
+    public void testHandshakeWithExecutorTLSv13() throws Exception {
+        assumeTrue(SslProvider.isTlsv13Supported(SslProvider.JDK));
+        ExecutorService executorService = Executors.newCachedThreadPool();
+        try {
+            testHandshakeWithExecutor(executorService, "TLSv1.3");
         } finally {
             executorService.shutdown();
         }
@@ -155,15 +229,30 @@ public class NettyBlockHoundIntegrationTest {
 
     @Test
     public void testTrustManagerVerify() throws Exception {
+        testTrustManagerVerify("TLSv1.2");
+    }
+
+    @Test
+    public void testTrustManagerVerifyTLSv13() throws Exception {
+        assumeTrue(SslProvider.isTlsv13Supported(SslProvider.JDK));
+        testTrustManagerVerify("TLSv1.3");
+    }
+
+    private static void testTrustManagerVerify(String tlsVersion) throws Exception {
         final SslContext sslClientCtx =
                 SslContextBuilder.forClient()
-                                 .trustManager(ResourcesUtil.getFile(getClass(), "mutual_auth_ca.pem"))
+                                 .protocols(tlsVersion)
+                                 .trustManager(ResourcesUtil.getFile(
+                                         NettyBlockHoundIntegrationTest.class, "mutual_auth_ca.pem"))
                                  .build();
 
         final SslContext sslServerCtx =
-                SslContextBuilder.forServer(ResourcesUtil.getFile(getClass(), "localhost_server.pem"),
-                                            ResourcesUtil.getFile(getClass(), "localhost_server.key"),
+                SslContextBuilder.forServer(ResourcesUtil.getFile(
+                        NettyBlockHoundIntegrationTest.class, "localhost_server.pem"),
+                                            ResourcesUtil.getFile(
+                                                    NettyBlockHoundIntegrationTest.class, "localhost_server.key"),
                                             null)
+                                 .protocols(tlsVersion)
                                  .build();
 
         final SslHandler clientSslHandler = sslClientCtx.newHandler(UnpooledByteBufAllocator.DEFAULT);
@@ -172,8 +261,7 @@ public class NettyBlockHoundIntegrationTest {
         testHandshake(sslClientCtx, clientSslHandler, serverSslHandler);
     }
 
-    private static void testHandshakeWithExecutor(Executor executor) throws Exception {
-        String tlsVersion = "TLSv1.2";
+    private static void testHandshakeWithExecutor(Executor executor, String tlsVersion) throws Exception {
         final SslContext sslClientCtx = SslContextBuilder.forClient()
                 .trustManager(InsecureTrustManagerFactory.INSTANCE)
                 .sslProvider(SslProvider.JDK).protocols(tlsVersion).build();
@@ -223,8 +311,8 @@ public class NettyBlockHoundIntegrationTest {
                     }).connect(sc.localAddress());
             cc = future.syncUninterruptibly().channel();
 
-            assertTrue(clientSslHandler.handshakeFuture().await().isSuccess());
-            assertTrue(serverSslHandler.handshakeFuture().await().isSuccess());
+            clientSslHandler.handshakeFuture().await().sync();
+            serverSslHandler.handshakeFuture().await().sync();
         } finally {
             if (cc != null) {
                 cc.close().syncUninterruptibly();
@@ -234,6 +322,36 @@ public class NettyBlockHoundIntegrationTest {
             }
             group.shutdownGracefully();
             ReferenceCountUtil.release(sslClientCtx);
+        }
+    }
+
+    private static class TestLinkedBlockingQueue<T> extends LinkedBlockingQueue<T> {
+
+        private final ReentrantLock lock = new ReentrantLock();
+
+        @Override
+        public boolean offer(T t) {
+            lock.lock();
+            try {
+                return super.offer(t);
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        void emulateContention() {
+            lock.lock();
+        }
+
+        void waitUntilContented() throws InterruptedException {
+            // wait until the lock gets contended
+            while (lock.getQueueLength() == 0) {
+                Thread.sleep(10L);
+            }
+        }
+
+        void removeContention() {
+            lock.unlock();
         }
     }
 }
