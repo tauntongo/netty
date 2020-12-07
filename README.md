@@ -1,3 +1,27 @@
+# How to compile netty source
+
+1. config your maven settings.xml file [see](https://github.com/trustin/os-maven-plugin)
+
+   - ```
+     <profiles>
+       <profile>
+         <id>os-properties</id>
+         <properties>
+         <!-- platform properties,will be used in pom.xml -->
+           <os.detected.name>linux</os.detected.name>
+           <os.detected.arch>x86_64</os.detected.arch>
+           <os.detected.classifier>linux-x86_64</os.detected.classifier>
+         </properties>
+       </profile>
+     </profiles>
+     
+     <activeProfiles>
+       <activeProfile>os-properties</activeProfile>
+     </activeProfiles>
+     ```
+
+     
+
 # Netty Project
 
 Netty is an asynchronous event-driven network application framework for rapid development of maintainable high performance protocol servers & clients.
